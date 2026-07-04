@@ -1,0 +1,31 @@
+source_dir: "C:/Users/you/OneDrive/Lectures"
+obsidian_vault_dir: "C:/Users/you/ObsidianVault/Lecture Notes"
+temp_dir: "C:/Users/you/.lecture_transcriber/temp"
+transcript_dir: "C:/Users/you/.lecture_transcriber/transcripts"
+archive_dir: "C:/Users/you/.lecture_transcriber/processed"
+error_dir: "C:/Users/you/.lecture_transcriber/errors"
+
+calendar_rename:
+  enabled: true
+  provider: "auto" # auto uses Graph when configured, otherwise falls back to local Outlook
+  graph_auth_mode: "device_code" # device_code supports personal Microsoft accounts
+  lookback_minutes: 180
+  lookahead_minutes: 180
+  graph_tenant_id: "consumers" # use your tenant ID for org accounts
+  graph_client_id: ""
+  graph_client_secret: "" # only needed for client_credentials mode
+  graph_mailbox_user: "" # optional for device_code, required for client_credentials
+  graph_token_cache_path: "C:/Users/you/.lecture_transcriber/graph_token_cache.json"
+
+transcription:
+  model: "base"
+  backend: "whisper"
+  device: "cpu"
+
+ollama:
+  model: "llama2"
+  prompt_template: |
+    You are a lecture notes assistant. Summarize the following transcript into Obsidian-compatible Markdown notes with headings, bullet points, definitions, and examples.
+
+    Transcript:
+    {transcript}
