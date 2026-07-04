@@ -1,57 +1,55 @@
-from datetime import datetime
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from .config import CalendarRenameConfig
+
+GRAPH_SCOPES = ["Calendars.Read"]
+PLACEHOLDER_CLIENT_IDS = {"your_public_client_id_here", "your-client-id", "client_id_here"}
 
 
-def find_class_for_timestamp(
-    target_time: datetime,
-    config=None,
-    lookback_minutes: int = 180,
-    lookahead_minutes: int = 180,
-) -> Optional[str]:
+def _select_subject_for_timestamp(target_time: datetime, events: list[tuple[str, datetime, datetime]]) -> Optional[str]:
     """
-    Find the calendar class matching a recording timestamp.
+    Find the best matching event for a target time.
     
-    Tries Outlook COM first, then falls back to hardcoded schedule for afternoon classes.
-    Returns None if no matching class is found.
-    """
-    # Try Outlook COM first
-    subject = _find_outlook_class_for_timestamp(target_time, lookback_minutes, lookahead_minutes)
-    if subject:
-        return subject
+    Strategy:
+    1. Prefer events where target_time falls within [start - 5min, end + 5min]
+    2. If no direct match, consider closest event if it's within 30 minutes
+    3. Return None if no reasonable match found
     
-    # Fallback: Try hardcoded afternoon schedule for cases where Outlook COM
-    # doesn't return all calendar events (known COM limitation)
-    return _try_hardcoded_afternoon_schedule(target_time)
-
-
-def _select_subject_for_timestamp(
-    target_time: datetime, candidates: list[tuple[str, datetime, datetime]]
-) -> Optional[str]:
+    This allows for recordings that start slightly before/after class but are
+    clearly intended for that class (e.g., 1:01 PM recording for 1:00 PM class).
     """
-    Select best matching subject from candidate (class_name, start, end) tuples.
-    
-    Two-tier strategy:
-    1. Prefer direct match: recording time within class window (+/- 5 minutes)
-    2. Fallback: closest match within 30-minute threshold from class start
-    """
-    direct_match = None
     best_subject = None
     best_distance = None
+    direct_match = None
+    direct_match_distance = None
     
-    for subject, start, end in candidates:
-        # Check if target falls within class window with 5-minute buffer
-        window_start = start.replace(minute=start.minute - 5)
-        window_end = end.replace(minute=end.minute + 5)
+    max_distance_threshold = timedelta(minutes=30)
+    event_buffer = timedelta(minutes=5)
+    
+    for subject, start_time, end_time in events:
+        if not subject:
+            continue
         
-        if window_start <= target_time <= window_end:
-            direct_match = subject
-            break
+        # Preference 1: Recording within event window (or within 5 minutes before/after)
+        if (start_time - event_buffer) <= target_time <= (end_time + event_buffer):
+            distance_seconds = abs((target_time - start_time).total_seconds())
+            if direct_match_distance is None or distance_seconds < direct_match_distance:
+                direct_match_distance = distance_seconds
+                direct_match = subject
         
-        # Track closest match (within 30-minute threshold)
-        distance = abs((target_time - start).total_seconds())
-        if distance <= 30 * 60:  # 30 minute threshold
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
+        # Preference 2: Closest event (only if reasonably close)
+        distance = abs(target_time - start_time)
+        if distance <= max_distance_threshold:
+            distance_seconds = distance.total_seconds()
+            if best_distance is None or distance_seconds < best_distance:
+                best_distance = distance_seconds
                 best_subject = subject
     
     # Return direct match if found, otherwise return closest (if within threshold)
@@ -63,8 +61,20 @@ def _format_outlook_datetime(value: datetime) -> str:
 
 
 def _to_local_naive(value: datetime) -> datetime:
+    """
+    Convert a datetime to naive local time.
+    
+    IMPORTANT: Outlook COM returns times with a UTC offset marker, but the 
+    underlying times are actually in local time (EDT/EST). If we call 
+    astimezone() on these, it will incorrectly interpret the "UTC" marker 
+    and convert 1:00 PM (marked as UTC) to 9:00 AM EDT.
+    
+    Solution: Simply strip the timezone info without converting, since the 
+    time values are already in local time.
+    """
     if value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
+        # Just remove the timezone info - don't convert
+        return value.replace(tzinfo=None)
     return datetime(value.year, value.month, value.day, value.hour, value.minute, value.second)
 
 
@@ -101,61 +111,38 @@ def _find_outlook_class_for_timestamp(
             "Outlook calendar lookup is unavailable. Verify Outlook is connected or disable calendar_rename."
         ) from exc
 
+    target_variants = _target_time_variants(target_time)
+    window_start = min(target_variants) - timedelta(minutes=lookback_minutes)
+    window_end = max(target_variants) + timedelta(minutes=lookahead_minutes)
+
     candidates: list[tuple[str, datetime, datetime]] = []
     
-    # Convert target time and search window
-    target_naive = _to_local_naive(target_time)
-    window_start = target_naive.replace(minute=target_naive.minute - lookback_minutes)
-    window_end = target_naive.replace(minute=target_naive.minute + lookahead_minutes)
-    
-    try:
-        for item in items:
-            item_start = _to_local_naive(item.Start)
-            item_end = _to_local_naive(item.End)
-            
-            # Only consider items within the search window
-            if item_start < window_end and item_end > window_start:
-                subject = str(item.Subject).strip()
-                if subject:
-                    candidates.append((subject, item_start, item_end))
-    except Exception:
-        pass
-    
-    if not candidates:
-        return None
-    
-    subject = _select_subject_for_timestamp(target_time, candidates)
-    if subject:
-        return subject
-    
-    # Fallback: Try hardcoded afternoon schedule for cases where Outlook COM
-    # doesn't return all calendar events (known COM limitation)
-    return _try_hardcoded_afternoon_schedule(target_time)
+    # Iterate through all items and filter manually (Restrict() doesn't iterate properly)
+    for event in items:
+        subject = str(getattr(event, "Subject", "") or "").strip()
+        if not subject:
+            continue
 
+        start = getattr(event, "Start", None)
+        end = getattr(event, "End", None)
+        if start is None or end is None:
+            continue
 
-def _try_hardcoded_afternoon_schedule(target_time: datetime) -> Optional[str]:
-    """
-    Fallback schedule for afternoon classes when Outlook COM doesn't return them.
+        start_time = _to_local_naive(start)
+        end_time = _to_local_naive(end)
+        
+        # Only include events in the search window
+        if end_time < window_start or start_time > window_end:
+            continue
+        
+        candidates.append((subject, start_time, end_time))
+
+    for target_variant in target_variants:
+        subject = _select_subject_for_timestamp(target_variant, candidates)
+        if subject:
+            return subject
     
-    This is a workaround for a limitation where the Python Outlook COM interface
-    doesn't return all calendar events that are visible in the Outlook UI.
-    """
-    # Define afternoon classes (EDT times)
-    afternoon_classes = [
-        ("Cer101", 13, 0, 13, 30),      # 1:00 PM - 1:30 PM
-        ("Bus101", 13, 30, 14, 0),      # 1:30 PM - 2:00 PM  
-        ("ENG209", 14, 30, 15, 0),      # 2:30 PM - 3:00 PM
-    ]
-    
-    # Build candidate list from hardcoded schedule
-    candidates: list[tuple[str, datetime, datetime]] = []
-    for class_name, start_h, start_m, end_h, end_m in afternoon_classes:
-        start = datetime(target_time.year, target_time.month, target_time.day, start_h, start_m, 0)
-        end = datetime(target_time.year, target_time.month, target_time.day, end_h, end_m, 0)
-        candidates.append((class_name, start, end))
-    
-    # Try to match against hardcoded schedule
-    return _select_subject_for_timestamp(target_time, candidates)
+    return None
 
 
 def _ensure_aware_local(value: datetime) -> datetime:
@@ -167,23 +154,234 @@ def _ensure_aware_local(value: datetime) -> datetime:
 def _parse_graph_datetime(value: str, timezone_name: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
-
-    import dateutil.parser
-
+    normalized = value.replace("Z", "+00:00")
     try:
-        dt = dateutil.parser.isoparse(value)
-    except Exception:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
         return None
 
-    if dt.tzinfo is not None:
-        dt = dt.astimezone()
+    if parsed.tzinfo is None:
+        if timezone_name and timezone_name.upper() in {"UTC", "COORDINATED UNIVERSAL TIME"}:
+            parsed = parsed.replace(tzinfo=UTC)
+        else:
+            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return parsed
 
-    return dt
+
+def _graph_authority(config: CalendarRenameConfig) -> str:
+    tenant = config.graph_tenant_id.strip() or "consumers"
+    return f"https://login.microsoftonline.com/{tenant}"
 
 
-def prime_graph_login(config=None) -> None:
-    """
-    Perform one-time Graph login to cache tokens for later use.
-    Raises RuntimeError if login fails.
-    """
-    pass  # Placeholder for Graph login implementation
+def _graph_token_cache_path(config: CalendarRenameConfig) -> Path:
+    configured = (config.graph_token_cache_path or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".lecture_transcriber" / "graph_token_cache.json"
+
+
+def _load_msal():
+    try:
+        import msal
+    except ImportError as exc:
+        raise RuntimeError("Microsoft Graph device-code auth requires msal. Install with `pip install msal`.") from exc
+    return msal
+
+
+def _acquire_graph_token_client_credentials(config: CalendarRenameConfig) -> str:
+    if not config.graph_tenant_id:
+        raise RuntimeError("calendar_rename.graph_tenant_id is required for Graph client_credentials auth.")
+    if not config.graph_client_id:
+        raise RuntimeError("calendar_rename.graph_client_id is required for Graph client_credentials auth.")
+    if not config.graph_client_secret:
+        raise RuntimeError("calendar_rename.graph_client_secret is required for Graph client_credentials auth.")
+
+    token_url = f"https://login.microsoftonline.com/{config.graph_tenant_id}/oauth2/v2.0/token"
+    payload = urlencode(
+        {
+            "client_id": config.graph_client_id,
+            "client_secret": config.graph_client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        }
+    ).encode("utf-8")
+    request = Request(token_url, data=payload, method="POST")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to acquire Microsoft Graph token: {exc}") from exc
+
+    token = str(data.get("access_token", "")).strip()
+    if not token:
+        raise RuntimeError("Failed to acquire Microsoft Graph token: access_token missing in response.")
+    return token
+
+
+def _acquire_graph_token_device_code(config: CalendarRenameConfig, interactive: bool) -> str:
+    if not config.graph_client_id:
+        raise RuntimeError("calendar_rename.graph_client_id is required for Graph device_code auth.")
+
+    msal = _load_msal()
+    cache_path = _graph_token_cache_path(config)
+    cache = msal.SerializableTokenCache()
+    if cache_path.exists():
+        try:
+            cache.deserialize(cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Graph token cache is invalid at {cache_path}. Delete it and run --graph-login again."
+            ) from exc
+
+    app = msal.PublicClientApplication(
+        client_id=config.graph_client_id,
+        authority=_graph_authority(config),
+        token_cache=cache,
+    )
+    accounts = app.get_accounts()
+    token_result = app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0]) if accounts else None
+
+    if token_result is None and interactive:
+        flow = app.initiate_device_flow(scopes=GRAPH_SCOPES)
+        if "user_code" not in flow:
+            raise RuntimeError(
+                flow.get("error_description", "Failed to start Graph device-code authentication flow.")
+            )
+        print(flow.get("message", "Complete device-code sign-in to continue."))
+        token_result = app.acquire_token_by_device_flow(flow)
+
+    if token_result is None:
+        raise RuntimeError(
+            "No cached Graph token available. Run `python -m lecture_transcriber --config <path> --graph-login` first."
+        )
+
+    access_token = str(token_result.get("access_token", "")).strip()
+    if not access_token:
+        raise RuntimeError(token_result.get("error_description", "Failed to acquire Graph access token."))
+
+    if cache.has_state_changed:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(cache.serialize(), encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"Failed to persist Graph token cache to {cache_path}: {exc}") from exc
+
+    return access_token
+
+
+def _graph_endpoint_for_calendar(config: CalendarRenameConfig, delegated: bool) -> str:
+    if delegated:
+        mailbox = (config.graph_mailbox_user or "").strip()
+        if mailbox:
+            return f"https://graph.microsoft.com/v1.0/users/{mailbox}/calendarView"
+        return "https://graph.microsoft.com/v1.0/me/calendarView"
+
+    mailbox = (config.graph_mailbox_user or "").strip()
+    if not mailbox:
+        raise RuntimeError("calendar_rename.graph_mailbox_user is required for Graph client_credentials auth.")
+    return f"https://graph.microsoft.com/v1.0/users/{mailbox}/calendarView"
+
+
+def _find_graph_class_for_timestamp(
+    target_time: datetime, lookback_minutes: int, lookahead_minutes: int, config: CalendarRenameConfig
+) -> Optional[str]:
+    auth_mode = (config.graph_auth_mode or "device_code").strip().lower()
+    if auth_mode == "client_credentials":
+        access_token = _acquire_graph_token_client_credentials(config)
+        delegated = False
+    elif auth_mode == "device_code":
+        access_token = _acquire_graph_token_device_code(config, interactive=False)
+        delegated = True
+    else:
+        raise RuntimeError(
+            f"Unsupported calendar_rename.graph_auth_mode '{config.graph_auth_mode}'. Use 'device_code' or 'client_credentials'."
+        )
+
+    target = _ensure_aware_local(target_time)
+    window_start = target - timedelta(minutes=lookback_minutes)
+    window_end = target + timedelta(minutes=lookahead_minutes)
+
+    query = urlencode(
+        {
+            "startDateTime": window_start.isoformat(),
+            "endDateTime": window_end.isoformat(),
+            "$select": "subject,start,end",
+            "$top": "200",
+        }
+    )
+    events_url = f"{_graph_endpoint_for_calendar(config, delegated=delegated)}?{query}"
+    request = Request(events_url, method="GET")
+    request.add_header("Authorization", f"Bearer {access_token}")
+    request.add_header("Accept", "application/json")
+    request.add_header("Prefer", 'outlook.timezone="UTC"')
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to query Microsoft Graph calendar events: {exc}") from exc
+
+    candidates: list[tuple[str, datetime, datetime]] = []
+    for event in payload.get("value", []):
+        subject = str(event.get("subject", "") or "").strip()
+        if not subject:
+            continue
+        start = event.get("start") or {}
+        end = event.get("end") or {}
+        start_time = _parse_graph_datetime(str(start.get("dateTime", "")), start.get("timeZone"))
+        end_time = _parse_graph_datetime(str(end.get("dateTime", "")), end.get("timeZone"))
+        if start_time is None or end_time is None:
+            continue
+        candidates.append((subject, start_time, end_time))
+    return _select_subject_for_timestamp(target, candidates)
+
+
+def prime_graph_login(config: CalendarRenameConfig) -> None:
+    _acquire_graph_token_device_code(config, interactive=True)
+
+
+def _graph_is_configured(config: CalendarRenameConfig) -> bool:
+    auth_mode = (config.graph_auth_mode or "device_code").strip().lower()
+    client_id = (config.graph_client_id or "").strip()
+    is_placeholder = client_id.lower() in PLACEHOLDER_CLIENT_IDS
+    if auth_mode == "device_code":
+        return bool(client_id) and not is_placeholder
+    if auth_mode == "client_credentials":
+        return bool(
+            config.graph_tenant_id and client_id and not is_placeholder and config.graph_client_secret and config.graph_mailbox_user
+        )
+    return False
+
+
+def find_class_for_timestamp(
+    target_time: datetime, config: CalendarRenameConfig, lookback_minutes: int = 180, lookahead_minutes: int = 180
+) -> Optional[str]:
+    provider = (config.provider or "auto").strip().lower()
+    auto_mode = provider == "auto"
+    if provider == "auto":
+        provider = "graph" if _graph_is_configured(config) else "outlook"
+    if provider == "outlook":
+        return _find_outlook_class_for_timestamp(
+            target_time,
+            lookback_minutes=lookback_minutes,
+            lookahead_minutes=lookahead_minutes,
+        )
+    if provider == "graph":
+        try:
+            return _find_graph_class_for_timestamp(
+                target_time,
+                lookback_minutes=lookback_minutes,
+                lookahead_minutes=lookahead_minutes,
+                config=config,
+            )
+        except RuntimeError:
+            if not auto_mode:
+                raise
+            return _find_outlook_class_for_timestamp(
+                target_time,
+                lookback_minutes=lookback_minutes,
+                lookahead_minutes=lookahead_minutes,
+            )
+    raise RuntimeError(f"Unsupported calendar_rename.provider '{config.provider}'. Use 'graph', 'outlook', or 'auto'.")

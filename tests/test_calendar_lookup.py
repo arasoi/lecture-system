@@ -73,10 +73,13 @@ class CalendarLookupTests(unittest.TestCase):
         result = calendar_lookup._select_subject_for_timestamp(target, events)
         self.assertIsNone(result)
 
-    def test_to_local_naive_converts_aware_datetime(self):
+    def test_to_local_naive_strips_timezone_without_converting(self):
+        # Outlook COM returns times with a UTC offset marker, but the times
+        # are actually in local time. We strip the timezone without converting.
         aware_utc = datetime(2026, 7, 4, 14, 30, 0, tzinfo=UTC)
         converted = calendar_lookup._to_local_naive(aware_utc)
-        expected = aware_utc.astimezone().replace(tzinfo=None)
+        # Should strip timezone but keep the time value
+        expected = datetime(2026, 7, 4, 14, 30, 0)
         self.assertEqual(converted, expected)
 
     def test_graph_lookup_requests_events_in_utc(self):
