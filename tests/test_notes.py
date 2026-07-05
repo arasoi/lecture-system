@@ -6,81 +6,140 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lecture_transcriber.notes import (
+    OllamaError,
+    build_markdown_with_template,
     find_lecture_notes_template,
     generate_notes_with_ollama,
-    write_markdown,
 )
 
 
-class FindLectureNotesTemplateTest(unittest.TestCase):
-    def test_reads_template_when_present(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            vault = Path(tmpdir)
-            template_dir = vault / "templates"
-            template_dir.mkdir()
-            template_file = template_dir / "LectureNotesTemplate.md"
-            template_file.write_text("# Template\nContent", encoding="utf-8")
+class GenerateNotesTests(unittest.TestCase):
+    def test_generate_notes_with_ollama_uses_utf8_for_non_ascii_transcript(self):
+        transcript = "Café naïve — π"
+        captured = {}
 
-            result = find_lecture_notes_template(vault)
-            self.assertEqual(result, "# Template\nContent")
+        def fake_run(*args, **kwargs):
+            captured["text"] = kwargs.get("text")
+            captured["encoding"] = kwargs.get("encoding")
+            captured["errors"] = kwargs.get("errors")
+            captured["input"] = kwargs.get("input")
+            return SimpleNamespace(stdout="ok")
 
-    def test_returns_none_when_template_missing(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            vault = Path(tmpdir)
-            result = find_lecture_notes_template(vault)
-            self.assertIsNone(result)
+        with patch("lecture_transcriber.notes.subprocess.run", side_effect=fake_run):
+            result = generate_notes_with_ollama(transcript, "model", "{transcript}")
 
+        self.assertEqual(result, "ok")
+        self.assertTrue(captured["text"])
+        self.assertEqual(captured["encoding"], "utf-8")
+        self.assertEqual(captured["errors"], "replace")
+        self.assertEqual(captured["input"], transcript)
 
-class GenerateNotesWithOllamaTest(unittest.TestCase):
-    def test_calls_ollama_with_formatted_prompt(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = SimpleNamespace(returncode=0, stdout="Generated notes")
+    def test_generate_notes_with_ollama_falls_back_to_cpu_on_gpu_error(self):
+        transcript = "hello"
+        calls = []
 
-            result = generate_notes_with_ollama("Test transcript", "llama2", "Summarize: {transcript}")
+        def fake_run(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 1:
+                raise subprocess.CalledProcessError(
+                    1,
+                    args[0],
+                    output="",
+                    stderr="CUDA error: shared object initialization failed",
+                )
+            return SimpleNamespace(stdout="fallback ok")
 
-            self.assertEqual(result, "Generated notes")
-            mock_run.assert_called_once()
+        with patch("lecture_transcriber.notes.subprocess.run", side_effect=fake_run):
+            result = generate_notes_with_ollama(transcript, "model", "{transcript}")
 
-    def test_raises_on_ollama_failure(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = SimpleNamespace(returncode=1, stderr="Error")
+        self.assertEqual(result, "fallback ok")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("OLLAMA_LLM_LIBRARY", calls[0][1]["env"])
+        self.assertEqual(calls[1][1]["env"]["OLLAMA_LLM_LIBRARY"], "cpu")
 
-            with self.assertRaises(RuntimeError):
-                generate_notes_with_ollama("Test", "llama2", "Summarize: {transcript}")
+    def test_generate_notes_with_ollama_strips_thinking_tags(self):
+        transcript = "hello"
 
-    def test_raises_on_timeout(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired("ollama", 300)
+        def fake_run(*args, **kwargs):
+            return SimpleNamespace(stdout="<think>internal reasoning</think>\n# Lecture Notes\n- point")
 
-            with self.assertRaises(RuntimeError):
-                generate_notes_with_ollama("Test", "llama2", "Summarize: {transcript}")
+        with patch("lecture_transcriber.notes.subprocess.run", side_effect=fake_run):
+            result = generate_notes_with_ollama(transcript, "model", "{transcript}")
 
+        self.assertEqual(result, "# Lecture Notes\n- point")
 
-class WriteMarkdownTest(unittest.TestCase):
-    def test_writes_content_to_file(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "test.md"
-            write_markdown(path, "Test content")
+    def test_generate_notes_with_ollama_strips_thinking_fenced_block(self):
+        transcript = "hello"
 
-            self.assertTrue(path.exists())
-            self.assertEqual(path.read_text(encoding="utf-8"), "Test content")
+        def fake_run(*args, **kwargs):
+            return SimpleNamespace(stdout="```thinking\nprivate chain of thought\n```\n\n## Summary\nDone")
 
-    def test_creates_parent_directories(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "nested" / "dirs" / "test.md"
-            write_markdown(path, "Test content")
+        with patch("lecture_transcriber.notes.subprocess.run", side_effect=fake_run):
+            result = generate_notes_with_ollama(transcript, "model", "{transcript}")
 
-            self.assertTrue(path.exists())
-            self.assertTrue(path.parent.exists())
+        self.assertEqual(result, "## Summary\nDone")
 
-    def test_prepends_template_when_provided(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "test.md"
-            write_markdown(path, "Body", template="# Template\n")
+    def test_generate_notes_with_ollama_strips_plain_thinking_preamble(self):
+        transcript = "hello"
+        noisy_output = (
+            "Thinking...\n"
+            "internal planning line \x1b[K\n"
+            "...done thinking.\n\n"
+            "# Lecture Notes\n"
+            "- point"
+        )
 
-            content = path.read_text(encoding="utf-8")
-            self.assertTrue(content.startswith("# Template"))
-            self.assertIn("Body", content)
+        def fake_run(*args, **kwargs):
+            return SimpleNamespace(stdout=noisy_output)
+
+        with patch("lecture_transcriber.notes.subprocess.run", side_effect=fake_run):
+            result = generate_notes_with_ollama(transcript, "model", "{transcript}")
+
+        self.assertEqual(result, "# Lecture Notes\n- point")
+
+    def test_build_markdown_with_template_prepends_template(self):
+        result = build_markdown_with_template("# Notes", "## Template")
+        self.assertEqual(result, "## Template\n\n# Notes")
+
+    def test_build_markdown_with_template_populates_metadata_properties(self):
+        template = "---\nClass Name:\nDate:\nTime:\n---"
+        output_path = Path(r"C:\vault\Lectures\bio101\07-03-2026_1.00.00PM.md")
+        result = build_markdown_with_template("# Notes", template, output_path=output_path)
+        self.assertIn("Class Name: bio101", result)
+        self.assertIn("Date: 07-03-2026", result)
+        self.assertIn("Time: 1.00.00PM", result)
+
+    def test_build_markdown_with_template_populates_metadata_with_class_prefix(self):
+        template = "---\nClass Name:\nDate:\nTime:\n---"
+        output_path = Path(r"C:\vault\Lectures\Cer101\cer101_07-04-2026_1.01.46PM.md")
+        result = build_markdown_with_template("# Notes", template, output_path=output_path)
+        self.assertIn("Class Name: Cer101", result)
+        self.assertIn("Date: 07-04-2026", result)
+        self.assertIn("Time: 1.01.46PM", result)
+
+    def test_find_lecture_notes_template_prefers_templates_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "ObsidianVault"
+            lectures = root / "Lectures"
+            templates = root / "templates"
+            lectures.mkdir(parents=True, exist_ok=True)
+            templates.mkdir(parents=True, exist_ok=True)
+            template_path = templates / "LectureNotesTemplate.md"
+            template_path.write_text("template", encoding="utf-8")
+
+            found = find_lecture_notes_template(lectures)
+
+            self.assertEqual(found, template_path)
+
+    def test_generate_notes_with_ollama_raises_on_timeout(self):
+        transcript = "hello"
+
+        with patch(
+            "lecture_transcriber.notes.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["ollama", "run", "model"], timeout=1),
+        ):
+            with self.assertRaises(OllamaError):
+                generate_notes_with_ollama(transcript, "model", "{transcript}")
 
 
 if __name__ == "__main__":
