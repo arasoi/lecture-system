@@ -118,17 +118,11 @@ def recording_timestamp_from_filename(stem: str) -> Optional[datetime]:
 def recording_timestamp_from_file_metadata(path: Path) -> datetime:
     """
     Get the recording timestamp from file metadata.
-    
-    Tries in order:
-    1. st_mtime (modification/last write time) - actual recording time for most files
-    2. st_ctime (creation time) - fallback for some file systems
-    
+
     Note: On Windows with OneDrive/copied files, st_ctime gets updated to copy time,
     but st_mtime preserves the original recording time.
     """
     stats = path.stat()
-    # Prefer mtime (modification time) over ctime (creation time) since files
-    # copied from OneDrive get new creation times but keep original modification times
     timestamp = stats.st_mtime
     return datetime.fromtimestamp(timestamp)
 
@@ -197,7 +191,6 @@ def resolve_recording_context(path: Path, config: AppConfig) -> RecordingContext
                     "Resolved class '%s' for recording %s using file metadata time %s",
                     class_name, path.name, meta_time.strftime("%Y-%m-%d %H:%M:%S"),
                 )
-                # Still use filename_time for the note name since it's more accurate
                 return RecordingContext(created_time=filename_time, class_name=class_name)
         except RuntimeError as exc:
             logger.debug("File metadata fallback lookup also failed: %s", exc)
@@ -210,7 +203,7 @@ def rename_file_for_calendar(path: Path, context: RecordingContext) -> Path:
     if parse_class_and_date(path.stem):
         logger.debug("File %s already matches calendar naming pattern; no rename needed", path.name)
         return path
-    
+
     if not context.class_name:
         logger.debug("No class resolved for %s; keeping original filename", path.name)
         return path
@@ -230,8 +223,8 @@ def rename_file_for_calendar(path: Path, context: RecordingContext) -> Path:
         renamed = path.with_name(f"{safe_class_name}_{date_text}_{time_text}_{index}{path.suffix.lower()}")
         index += 1
 
-    logger.info("Renaming %s \u2192 %s (class: %s, created: %s)", 
-                path.name, renamed.name, context.class_name, 
+    logger.info("Renaming %s \u2192 %s (class: %s, created: %s)",
+                path.name, renamed.name, context.class_name,
                 context.created_time.strftime("%Y-%m-%d %H:%M:%S"))
     path = path.replace(renamed)
     return path
@@ -262,7 +255,7 @@ def get_output_paths(source_path: Path, config: AppConfig, context: Optional[Rec
         note_path = config.obsidian_vault_dir / class_name / f"{prefixed_stem}.md"
         logger.info("Output paths (from filename): transcript=%s, note=%s", transcript_path, note_path)
         return transcript_path, note_path
-    
+
     note_path = config.obsidian_vault_dir / "unknown_class" / f"{stem}.md"
     logger.warning("Output paths (unknown class): transcript=%s, note=%s", transcript_path, note_path)
     return transcript_path, note_path
@@ -307,16 +300,21 @@ def reclassify_unknown_notes(config: AppConfig) -> None:
         class_dir = config.obsidian_vault_dir / format_class_for_filename(class_name)
         class_dir.mkdir(parents=True, exist_ok=True)
         class_prefix = format_class_for_filename(class_name)
-        destination_name = note_path.name
-        if not note_path.stem.lower().startswith(f"{class_prefix}_"):
-            destination_name = f"{class_prefix}_{note_path.name}"
-        destination = class_dir / destination_name
+
+        # Build canonical name from the parsed timestamp so the note is named correctly
+        # regardless of what the original filename looked like (raw timestamp, _1 suffix, etc.)
+        date_text = timestamp.strftime("%m-%d-%Y")
+        time_text = timestamp.strftime("%I.%M.%S%p").lstrip("0")
+        canonical_stem = f"{class_prefix}_{date_text}_{time_text}"
+        destination = class_dir / f"{canonical_stem}.md"
+
         index = 1
         while destination.exists():
-            destination = class_dir / f"{note_path.stem}_{index}{note_path.suffix}"
+            destination = class_dir / f"{canonical_stem}_{index}.md"
             index += 1
         note_path.replace(destination)
         moved_count += 1
+        logger.info("Reclassified %s -> %s/%s", note_path.name, class_name, destination.name)
 
     if moved_count:
         logger.info("Reclassified %d note(s) from unknown_class", moved_count)
