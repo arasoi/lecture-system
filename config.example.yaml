@@ -4,6 +4,12 @@ temp_dir: "C:/Users/you/.lecture_transcriber/temp"
 transcript_dir: "C:/Users/you/.lecture_transcriber/transcripts"
 archive_dir: "C:/Users/you/.lecture_transcriber/processed"
 error_dir: "C:/Users/you/.lecture_transcriber/errors"
+# Tracks which recordings have already been processed, so that a longer copy of a
+# recording replaces its notes instead of creating a second set.
+state_path: "C:/Users/you/.lecture_transcriber/processed_recordings.json"
+# How long a recording must sit untouched before it is treated as finished. Must outlast
+# the gap between OneDrive sync bursts, or half-synced recordings get processed. 0 disables.
+quiet_period_minutes: 20
 
 calendar_rename:
   enabled: true

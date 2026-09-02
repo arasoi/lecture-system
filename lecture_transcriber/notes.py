@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from .transcribe import subprocess_window_kwargs
+
 
 class OllamaError(RuntimeError):
     pass
@@ -17,17 +19,17 @@ DEFAULT_PROMPT_TEMPLATE = (
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 OLLAMA_TIMEOUT_SECONDS = 900
 
+# `ollama run` word-wraps its output for a terminal at roughly 80 columns. When a word
+# straddles the wrap column it emits the partial word, breaks the line, then reprints the
+# word in full -- a redraw a real terminal would absorb, but which lands verbatim in
+# captured output ("student presenta\npresentations"). We are capturing, not displaying,
+# so wrapping has no benefit here and Markdown soft-wraps long lines anyway.
+OLLAMA_BASE_COMMAND = ("ollama", "run")
+OLLAMA_OUTPUT_FLAGS = ("--nowordwrap",)
 
-def _subprocess_window_kwargs() -> dict[str, object]:
-    if os.name != "nt":
-        return {}
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = 0
-    return {
-        "startupinfo": startupinfo,
-        "creationflags": subprocess.CREATE_NO_WINDOW,
-    }
+
+def build_ollama_command(model_name: str) -> list[str]:
+    return [*OLLAMA_BASE_COMMAND, model_name, *OLLAMA_OUTPUT_FLAGS]
 
 
 def build_prompt(prompt_template: str, transcript_text: str) -> str:
@@ -76,7 +78,7 @@ def generate_notes_with_ollama(transcript_text: str, model_name: str, prompt_tem
 
     def run_ollama(current_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["ollama", "run", model_name],
+            build_ollama_command(model_name),
             input=prompt,
             capture_output=True,
             check=True,
@@ -85,7 +87,7 @@ def generate_notes_with_ollama(transcript_text: str, model_name: str, prompt_tem
             errors="replace",
             env=current_env,
             timeout=OLLAMA_TIMEOUT_SECONDS,
-            **_subprocess_window_kwargs(),
+            **subprocess_window_kwargs(),
         )
 
     try:
@@ -132,10 +134,13 @@ def find_lecture_notes_template(notes_root: Path) -> Optional[Path]:
     return None
 
 
-def _template_metadata_from_output_path(output_path: Path) -> dict[str, str]:
+def _template_metadata_from_output_path(
+    output_path: Path,
+    professor: Optional[str] = None,
+    building: Optional[str] = None,
+) -> dict[str, str]:
     class_name = output_path.parent.name
     stem = output_path.stem
-    # Optional class prefix (e.g. "cer101_") before the date/time segment
     match = re.match(
         r"^(?:[^_]+_)?(?P<date>\d{2}-\d{2}-\d{4})_(?P<time>\d{1,2}\.\d{2}\.\d{2}(?:AM|PM))(?:_\d+)?$",
         stem,
@@ -143,13 +148,20 @@ def _template_metadata_from_output_path(output_path: Path) -> dict[str, str]:
     )
     return {
         "Class Name": class_name,
+        "Professor": professor or "",
+        "Building": building or "",
         "Date": match.group("date") if match else "",
         "Time": match.group("time").upper() if match else "",
     }
 
 
-def _apply_template_metadata(template_text: str, output_path: Path) -> str:
-    metadata = _template_metadata_from_output_path(output_path)
+def _apply_template_metadata(
+    template_text: str,
+    output_path: Path,
+    professor: Optional[str] = None,
+    building: Optional[str] = None,
+) -> str:
+    metadata = _template_metadata_from_output_path(output_path, professor=professor, building=building)
     if not template_text.strip():
         return ""
     lines = []
@@ -166,10 +178,18 @@ def _apply_template_metadata(template_text: str, output_path: Path) -> str:
     return "\n".join(lines).strip()
 
 
-def build_markdown_with_template(notes: str, template_text: str, output_path: Optional[Path] = None) -> str:
+def build_markdown_with_template(
+    notes: str,
+    template_text: str,
+    output_path: Optional[Path] = None,
+    professor: Optional[str] = None,
+    building: Optional[str] = None,
+) -> str:
     notes_body = notes.strip()
     template_body = (
-        _apply_template_metadata(template_text, output_path) if output_path is not None else template_text.strip()
+        _apply_template_metadata(template_text, output_path, professor=professor, building=building)
+        if output_path is not None
+        else template_text.strip()
     )
     if not template_body:
         return notes_body
@@ -178,7 +198,60 @@ def build_markdown_with_template(notes: str, template_text: str, output_path: Op
     return f"{template_body}\n\n{notes_body}"
 
 
-def write_markdown(notes: str, output_path: Path, template_text: str = "") -> None:
+
+def update_note_frontmatter(note_path: Path, updates: dict) -> None:
+    """Update specific frontmatter key-value pairs in an existing note file.
+
+    Only modifies lines inside the YAML frontmatter block (between --- fences).
+    """
+    if not note_path.exists():
+        return
+    content = note_path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    result = []
+    fence_count = 0
+    seen_keys: set[str] = set()
+
+    for line in lines:
+        if line.strip() == "---":
+            if fence_count == 1:
+                for key, value in updates.items():
+                    if key not in seen_keys:
+                        result.append(f"{key}: {value}".rstrip())
+            fence_count += 1
+            result.append(line)
+            continue
+
+        in_frontmatter = fence_count == 1
+        if in_frontmatter:
+            replaced = False
+            for key, value in updates.items():
+                prefix = f"{key}:"
+                if line.strip().startswith(prefix):
+                    result.append(f"{prefix} {value}".rstrip())
+                    seen_keys.add(key)
+                    replaced = True
+                    break
+            if not replaced:
+                result.append(line)
+        else:
+            result.append(line)
+
+    note_path.write_text("\n".join(result) + "\n", encoding="utf-8")
+
+def write_markdown(
+    notes: str,
+    output_path: Path,
+    template_text: str = "",
+    professor: Optional[str] = None,
+    building: Optional[str] = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    final_markdown = build_markdown_with_template(notes, template_text, output_path=output_path)
+    final_markdown = build_markdown_with_template(
+        notes,
+        template_text,
+        output_path=output_path,
+        professor=professor,
+        building=building,
+    )
     output_path.write_text(final_markdown + "\n", encoding="utf-8")

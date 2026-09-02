@@ -11,9 +11,10 @@ from typing import Optional
 
 import yaml
 
-from .calendar_lookup import find_class_for_timestamp, prime_graph_login
+from .calendar_lookup import find_class_for_timestamp, find_class_info_for_timestamp, prime_graph_login
 from .config import AppConfig, ensure_directories, load_config
-from .notes import find_lecture_notes_template, generate_notes_with_ollama, write_markdown
+from .notes import find_lecture_notes_template, generate_notes_with_ollama, update_note_frontmatter, write_markdown
+from .state import ProcessedRecording, RecordingState, build_entry, describe_extent, recording_extent
 from .transcribe import (
     AUDIO_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -24,15 +25,26 @@ from .transcribe import (
     is_video_file,
     transcribe_audio,
 )
-from .watch_folder import FileProcessorQueue, watch_directory, wait_for_file_stability
+from .watch_folder import (
+    FileProcessorQueue,
+    recording_is_quiet,
+    seconds_since_last_write,
+    watch_directory,
+    wait_for_file_stability,
+)
 
 logger = logging.getLogger(__name__)
+
+# How often watch mode re-scans the source folder for recordings deferred as unfinished.
+RESCAN_INTERVAL_SECONDS = 300
 
 
 @dataclass(frozen=True)
 class RecordingContext:
     created_time: datetime
     class_name: Optional[str] = None
+    professor: Optional[str] = None
+    building: Optional[str] = None
 
 
 def validate_environment(config: AppConfig) -> None:
@@ -115,14 +127,36 @@ def recording_timestamp_from_filename(stem: str) -> Optional[datetime]:
     return None
 
 
+def recording_key(path: Path) -> Optional[str]:
+    """
+    Stable identity for a recording across the partial copies OneDrive syncs.
+
+    Keyed on the start timestamp encoded in the filename, which every partial copy
+    of the same recording shares. Returns None when the filename carries no
+    timestamp: without one, successive partials cannot be told apart from separate
+    recordings, so tracking is skipped rather than risk collapsing two real
+    lectures into a single note.
+    """
+    timestamp = recording_timestamp_from_filename(path.stem)
+    if timestamp is None:
+        return None
+    return timestamp.strftime("%Y%m%dT%H%M%S")
+
+
 def recording_timestamp_from_file_metadata(path: Path) -> datetime:
     """
     Get the recording timestamp from file metadata.
-
+    
+    Tries in order:
+    1. st_mtime (modification/last write time) - actual recording time for most files
+    2. st_ctime (creation time) - fallback for some file systems
+    
     Note: On Windows with OneDrive/copied files, st_ctime gets updated to copy time,
     but st_mtime preserves the original recording time.
     """
     stats = path.stat()
+    # Prefer mtime (modification time) over ctime (creation time) since files
+    # copied from OneDrive get new creation times but keep original modification times
     timestamp = stats.st_mtime
     return datetime.fromtimestamp(timestamp)
 
@@ -156,7 +190,7 @@ def resolve_recording_context(path: Path, config: AppConfig) -> RecordingContext
     )
 
     try:
-        class_name = find_class_for_timestamp(
+        event_info = find_class_info_for_timestamp(
             lookup_time,
             config=config.calendar_rename,
             lookback_minutes=config.calendar_rename.lookback_minutes,
@@ -166,12 +200,20 @@ def resolve_recording_context(path: Path, config: AppConfig) -> RecordingContext
         logger.error("Calendar-based class lookup failed for %s: %s", path.name, exc)
         return RecordingContext(created_time=lookup_time, class_name=None)
 
-    if class_name:
+    if event_info:
         logger.info(
-            "Resolved class '%s' for recording %s (lookup time: %s)",
-            class_name, path.name, lookup_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "Resolved class '%s' (professor: %s, building: %s) for recording %s (lookup time: %s)",
+            event_info.class_name,
+            event_info.professor or "N/A",
+            event_info.building or "N/A",
+            path.name, lookup_time.strftime("%Y-%m-%d %H:%M:%S"),
         )
-        return RecordingContext(created_time=lookup_time, class_name=class_name)
+        return RecordingContext(
+            created_time=lookup_time,
+            class_name=event_info.class_name,
+            professor=event_info.professor,
+            building=event_info.building,
+        )
 
     # Fallback: if filename time was used but didn't match, try file metadata time
     if filename_time and meta_time != filename_time:
@@ -180,18 +222,24 @@ def resolve_recording_context(path: Path, config: AppConfig) -> RecordingContext
             filename_time.strftime("%Y-%m-%d %H:%M:%S"), path.name, meta_time.strftime("%Y-%m-%d %H:%M:%S"),
         )
         try:
-            class_name = find_class_for_timestamp(
+            event_info = find_class_info_for_timestamp(
                 meta_time,
                 config=config.calendar_rename,
                 lookback_minutes=config.calendar_rename.lookback_minutes,
                 lookahead_minutes=config.calendar_rename.lookahead_minutes,
             )
-            if class_name:
+            if event_info:
                 logger.info(
                     "Resolved class '%s' for recording %s using file metadata time %s",
-                    class_name, path.name, meta_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    event_info.class_name, path.name, meta_time.strftime("%Y-%m-%d %H:%M:%S"),
                 )
-                return RecordingContext(created_time=filename_time, class_name=class_name)
+                # Still use filename_time for the note name since it's more accurate
+                return RecordingContext(
+                    created_time=filename_time,
+                    class_name=event_info.class_name,
+                    professor=event_info.professor,
+                    building=event_info.building,
+                )
         except RuntimeError as exc:
             logger.debug("File metadata fallback lookup also failed: %s", exc)
 
@@ -203,7 +251,7 @@ def rename_file_for_calendar(path: Path, context: RecordingContext) -> Path:
     if parse_class_and_date(path.stem):
         logger.debug("File %s already matches calendar naming pattern; no rename needed", path.name)
         return path
-
+    
     if not context.class_name:
         logger.debug("No class resolved for %s; keeping original filename", path.name)
         return path
@@ -223,8 +271,8 @@ def rename_file_for_calendar(path: Path, context: RecordingContext) -> Path:
         renamed = path.with_name(f"{safe_class_name}_{date_text}_{time_text}_{index}{path.suffix.lower()}")
         index += 1
 
-    logger.info("Renaming %s \u2192 %s (class: %s, created: %s)",
-                path.name, renamed.name, context.class_name,
+    logger.info("Renaming %s → %s (class: %s, created: %s)", 
+                path.name, renamed.name, context.class_name, 
                 context.created_time.strftime("%Y-%m-%d %H:%M:%S"))
     path = path.replace(renamed)
     return path
@@ -255,7 +303,7 @@ def get_output_paths(source_path: Path, config: AppConfig, context: Optional[Rec
         note_path = config.obsidian_vault_dir / class_name / f"{prefixed_stem}.md"
         logger.info("Output paths (from filename): transcript=%s, note=%s", transcript_path, note_path)
         return transcript_path, note_path
-
+    
     note_path = config.obsidian_vault_dir / "unknown_class" / f"{stem}.md"
     logger.warning("Output paths (unknown class): transcript=%s, note=%s", transcript_path, note_path)
     return transcript_path, note_path
@@ -285,7 +333,7 @@ def reclassify_unknown_notes(config: AppConfig) -> None:
         if timestamp is None:
             continue
         try:
-            class_name = find_class_for_timestamp(
+            event_info = find_class_info_for_timestamp(
                 timestamp,
                 config=config.calendar_rename,
                 lookback_minutes=config.calendar_rename.lookback_minutes,
@@ -294,8 +342,9 @@ def reclassify_unknown_notes(config: AppConfig) -> None:
         except RuntimeError as exc:
             logger.warning("Calendar lookup unavailable while reclassifying %s: %s", note_path, exc)
             return
-        if not class_name:
+        if not event_info:
             continue
+        class_name = event_info.class_name
 
         class_dir = config.obsidian_vault_dir / format_class_for_filename(class_name)
         class_dir.mkdir(parents=True, exist_ok=True)
@@ -313,6 +362,14 @@ def reclassify_unknown_notes(config: AppConfig) -> None:
             destination = class_dir / f"{canonical_stem}_{index}.md"
             index += 1
         note_path.replace(destination)
+        # Rewrite frontmatter so Class Name, Date, Time reflect the actual class
+        update_note_frontmatter(destination, {
+            "Class Name": class_name,
+            "Professor": event_info.professor or "",
+            "Building": event_info.building or "",
+            "Date": date_text,
+            "Time": time_text.upper(),
+        })
         moved_count += 1
         logger.info("Reclassified %s -> %s/%s", note_path.name, class_name, destination.name)
 
@@ -339,13 +396,54 @@ def move_file_to_target(source_path: Path, target_dir: Optional[Path]) -> Path:
         return destination
 
 
+def partials_dir(archive_dir: Optional[Path]) -> Optional[Path]:
+    """Where shorter, superseded copies of a recording are parked."""
+    if archive_dir is None:
+        return None
+    return archive_dir / "partials"
+
+
+def discard_superseded_outputs(previous: ProcessedRecording, transcript_path: Path, note_path: Path) -> None:
+    """
+    Remove the transcript and note written from an earlier, shorter copy of a recording.
+
+    Outputs the new pass just overwrote are left alone. Only when the class resolved
+    differently between passes do the new outputs land elsewhere, leaving the old ones
+    behind as duplicates.
+    """
+    for stale, replacement in ((previous.transcript, transcript_path), (previous.note, note_path)):
+        if stale == replacement or not stale.exists():
+            continue
+        try:
+            stale.unlink()
+            logger.info("Removed superseded output %s", stale)
+        except OSError as exc:
+            logger.warning("Could not remove superseded output %s: %s", stale, exc)
+
+
+def retire_superseded_archive(previous: ProcessedRecording, archive_dir: Path) -> None:
+    """Move the shorter archived copy out of the archive root so one file per lecture remains."""
+    if not previous.archive_path:
+        return
+    stale = Path(previous.archive_path)
+    if not stale.exists() or stale.parent != archive_dir:
+        return
+    moved = move_file_to_target(stale, partials_dir(archive_dir))
+    logger.info("Moved superseded recording %s to %s", stale.name, moved)
+
+
 def should_process(path: Path) -> bool:
     if path.name.startswith("~") or path.name.startswith("."):
         return False
     return is_audio_file(path) or is_video_file(path)
 
 
-def process_file(path: Path, config: AppConfig, force: bool = False) -> None:
+def process_file(
+    path: Path,
+    config: AppConfig,
+    force: bool = False,
+    state: Optional[RecordingState] = None,
+) -> None:
     if not should_process(path):
         logger.debug("Skipping unsupported file %s", path)
         return
@@ -356,15 +454,60 @@ def process_file(path: Path, config: AppConfig, force: bool = False) -> None:
 
     audio_path = path
     try:
+        # A recording still being synced is left in place rather than waited on: the
+        # watcher runs on a short interval, so a later pass picks it up once it is
+        # finished. Blocking here would stall the queue for the whole quiet period.
+        quiet_seconds = config.quiet_period_minutes * 60
+        if not force and not recording_is_quiet(path, quiet_seconds):
+            logger.info(
+                "Deferring %s: last written %.1f min ago, waiting for %d min of quiet before processing",
+                path.name,
+                seconds_since_last_write(path) / 60,
+                config.quiet_period_minutes,
+            )
+            return
+
         if not wait_for_file_stability(path):
             logger.warning("File did not stabilize: %s", path)
             return
 
+        key = recording_key(path)
         recording_context = resolve_recording_context(path, config)
         path = rename_file_for_calendar(path, recording_context)
 
+        # OneDrive delivers an in-progress recording as a series of increasingly long
+        # copies under the same name. Compare against the longest copy already handled
+        # so each lecture ends up with exactly one transcript and one note.
+        tracked = state is not None and key is not None
+        previous = state.get(key) if tracked else None
+        extent, extent_kind = recording_extent(path) if tracked else (0.0, "")
+
+        if previous is not None and not force and not previous.is_superseded_by(extent, extent_kind):
+            logger.info(
+                "Skipping %s: a copy of this recording holding at least as much audio was already "
+                "processed (%s vs %s). Notes are at %s",
+                path.name,
+                describe_extent(extent, extent_kind),
+                describe_extent(previous.extent, previous.extent_kind),
+                previous.note_path,
+            )
+            if config.archive_dir is not None:
+                parked = move_file_to_target(path, partials_dir(config.archive_dir))
+                logger.info("Moved duplicate copy to %s", parked)
+            return
+
+        if previous is not None:
+            logger.info(
+                "Recording %s is a longer copy of one already processed (%s vs %s); replacing its notes",
+                path.name,
+                describe_extent(extent, extent_kind),
+                describe_extent(previous.extent, previous.extent_kind),
+            )
+
         transcript_path, note_path = get_output_paths(path, config, context=recording_context)
-        if not force:
+        # A known recording rewrites its own outputs; uniquifying here is what produced
+        # the duplicate `_1`, `_2` notes in the first place.
+        if previous is None and not force:
             transcript_path, note_path = ensure_unique_output_paths(transcript_path, note_path)
 
         logger.info("Processing %s", path)
@@ -397,12 +540,37 @@ def process_file(path: Path, config: AppConfig, force: bool = False) -> None:
                 "Lecture notes template not found. Expected LectureNotesTemplate in ObsidianVault\\templates."
             )
         template_text = template_path.read_text(encoding="utf-8")
-        write_markdown(notes_text, note_path, template_text=template_text)
+        write_markdown(
+            notes_text,
+            note_path,
+            template_text=template_text,
+            professor=recording_context.professor,
+            building=recording_context.building,
+        )
         logger.info("Saved lecture notes to %s", note_path)
 
+        if previous is not None:
+            discard_superseded_outputs(previous, transcript_path, note_path)
+
+        archived_path: Optional[Path] = None
         if config.archive_dir is not None:
-            moved = move_file_to_target(path, config.archive_dir)
-            logger.info("Moved processed file to %s", moved)
+            archived_path = move_file_to_target(path, config.archive_dir)
+            logger.info("Moved processed file to %s", archived_path)
+            if previous is not None:
+                retire_superseded_archive(previous, config.archive_dir)
+
+        if tracked:
+            state.record(
+                build_entry(
+                    key=key,
+                    extent=extent,
+                    extent_kind=extent_kind,
+                    transcript_path=transcript_path,
+                    note_path=note_path,
+                    source_name=path.name,
+                    archive_path=archived_path,
+                )
+            )
     except Exception:
         logger.exception("Failed to process %s", path)
         if config.error_dir is not None:
@@ -444,6 +612,8 @@ def generate_config(path: Path) -> int:
     transcript_dir = prompt_value("Transcript output folder", str(home / ".lecture_transcriber/transcripts"))
     archive_dir = prompt_value("Archive folder for processed recordings", str(home / ".lecture_transcriber/processed"))
     error_dir = prompt_value("Error folder for failed recordings", str(home / ".lecture_transcriber/errors"))
+    state_path = prompt_value("Processed-recording state file", str(home / ".lecture_transcriber/processed_recordings.json"))
+    quiet_period_minutes = prompt_value("Minutes a recording must sit untouched before processing", "20")
     calendar_rename_enabled = prompt_value("Rename files from calendar metadata (true/false)", "true")
     calendar_provider = prompt_value("Calendar provider (auto/graph/outlook)", "auto")
     graph_auth_mode = prompt_value("Graph auth mode (device_code/client_credentials)", "device_code")
@@ -456,19 +626,21 @@ def generate_config(path: Path) -> int:
     graph_token_cache_path = prompt_value("Microsoft Graph token cache file path", str(home / ".lecture_transcriber/graph_token_cache.json"))
     whisper_model = prompt_value("Whisper model name", "base")
     device = prompt_value("Transcription device (cpu/cuda)", "cpu")
-    ollama_model = prompt_value("Ollama model name", "llama3")
+    ollama_model = prompt_value("Ollama model name", "llama2")
 
-    config_data = {
+    config = {
         "source_dir": source_dir,
         "obsidian_vault_dir": obsidian_vault_dir,
         "temp_dir": temp_dir,
         "transcript_dir": transcript_dir,
         "archive_dir": archive_dir,
         "error_dir": error_dir,
+        "state_path": state_path,
+        "quiet_period_minutes": int(quiet_period_minutes),
         "calendar_rename": {
-            "enabled": calendar_rename_enabled.lower() in {"true", "yes", "1"},
-            "provider": calendar_provider,
-            "graph_auth_mode": graph_auth_mode,
+            "enabled": calendar_rename_enabled.strip().lower() in {"1", "true", "yes", "y"},
+            "provider": calendar_provider.strip().lower(),
+            "graph_auth_mode": graph_auth_mode.strip().lower(),
             "lookback_minutes": int(calendar_rename_lookback),
             "lookahead_minutes": int(calendar_rename_lookahead),
             "graph_tenant_id": graph_tenant_id,
@@ -479,26 +651,31 @@ def generate_config(path: Path) -> int:
         },
         "transcription": {
             "model": whisper_model,
+            "backend": "whisper",
             "device": device,
         },
         "ollama": {
             "model": ollama_model,
+            "prompt_template": (
+                "You are a lecture notes assistant. Summarize the following transcript into Obsidian-compatible Markdown notes "
+                "with headings, bullet points, definitions, and examples.\n\nTranscript:\n{transcript}"
+            ),
         },
     }
 
-    path.write_text(yaml.dump(config_data, default_flow_style=False), encoding="utf-8")
-    print(f"Config written to {path}")
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    print(f"Wrote configuration to {path}")
     return 0
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lecture transcription watcher")
-    parser.add_argument("--config", default="config.yaml", help="Path to config file")
-    parser.add_argument("--once", action="store_true", help="Process existing files and exit")
-    parser.add_argument("--force", action="store_true", help="Re-process files that already have output")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--generate-config", action="store_true", help="Generate a config file interactively")
-    parser.add_argument("--graph-login", action="store_true", help="Authenticate with Microsoft Graph (device-code flow)")
+    parser = argparse.ArgumentParser(description="Watch a OneDrive folder and convert lectures into Obsidian notes.")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML configuration file.")
+    parser.add_argument("--once", action="store_true", help="Process existing files once and exit.")
+    parser.add_argument("--force", action="store_true", help="Reprocess files even if notes already exist.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("--generate-config", action="store_true", help="Interactively generate a configuration file and exit.")
+    parser.add_argument("--graph-login", action="store_true", help="Run Microsoft Graph device-code login and cache token, then exit.")
     return parser.parse_args()
 
 
@@ -535,7 +712,8 @@ def main() -> int:
         logger.error(exc)
         return 3
 
-    processor = FileProcessorQueue(lambda path: process_file(path, config, force=args.force))
+    state = RecordingState(config.state_path)
+    processor = FileProcessorQueue(lambda path: process_file(path, config, force=args.force, state=state))
     enqueue_existing_files(config, processor)
 
     if args.once:
@@ -547,9 +725,14 @@ def main() -> int:
 
     logger.info("Watching %s for new lecture files...", config.source_dir)
     try:
+        next_rescan = time.monotonic() + RESCAN_INTERVAL_SECONDS
         while True:
-            args = None
             time.sleep(1)
+            # Recordings deferred while still syncing need another look: no filesystem
+            # event fires once a recording simply stops growing.
+            if time.monotonic() >= next_rescan:
+                enqueue_existing_files(config, processor)
+                next_rescan = time.monotonic() + RESCAN_INTERVAL_SECONDS
     except KeyboardInterrupt:
         logger.info("Stopping watcher")
     finally:

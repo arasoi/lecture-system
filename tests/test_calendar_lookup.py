@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from lecture_transcriber import calendar_lookup
-from lecture_transcriber.calendar_lookup import find_class_for_timestamp
+from lecture_transcriber.calendar_lookup import CalendarEventInfo, find_class_for_timestamp
 from lecture_transcriber.config import CalendarRenameConfig
 
 
@@ -20,7 +20,10 @@ class CalendarLookupTests(unittest.TestCase):
             graph_mailbox_user="user@contoso.com",
         )
 
-        with patch("lecture_transcriber.calendar_lookup._find_graph_class_for_timestamp", return_value="bio101") as graph:
+        with patch(
+            "lecture_transcriber.calendar_lookup._find_graph_event_info_for_timestamp",
+            return_value=CalendarEventInfo(class_name="bio101"),
+        ) as graph:
             result = find_class_for_timestamp(datetime.now(), config, lookback_minutes=60, lookahead_minutes=60)
 
         self.assertEqual(result, "bio101")
@@ -29,7 +32,10 @@ class CalendarLookupTests(unittest.TestCase):
     def test_auto_provider_falls_back_to_outlook_without_graph_config(self):
         config = CalendarRenameConfig(enabled=True, provider="auto")
 
-        with patch("lecture_transcriber.calendar_lookup._find_outlook_class_for_timestamp", return_value="bio101") as outlook:
+        with patch(
+            "lecture_transcriber.calendar_lookup._find_outlook_event_info_for_timestamp",
+            return_value=CalendarEventInfo(class_name="bio101"),
+        ) as outlook:
             result = find_class_for_timestamp(datetime.now(), config, lookback_minutes=60, lookahead_minutes=60)
 
         self.assertEqual(result, "bio101")
@@ -45,7 +51,10 @@ class CalendarLookupTests(unittest.TestCase):
             graph_mailbox_user="user@contoso.com",
         )
 
-        with patch("lecture_transcriber.calendar_lookup._find_outlook_class_for_timestamp", return_value="bio101") as outlook:
+        with patch(
+            "lecture_transcriber.calendar_lookup._find_outlook_event_info_for_timestamp",
+            return_value=CalendarEventInfo(class_name="bio101"),
+        ) as outlook:
             result = find_class_for_timestamp(datetime.now(), config, lookback_minutes=60, lookahead_minutes=60)
 
         self.assertEqual(result, "bio101")
@@ -59,8 +68,8 @@ class CalendarLookupTests(unittest.TestCase):
     def test_select_subject_requires_timestamp_within_event(self):
         target = datetime(2026, 7, 4, 14, 44, 47)
         events = [
-            ("Bus101", datetime(2026, 7, 4, 13, 30, 0), datetime(2026, 7, 4, 14, 0, 0)),
-            ("ENG209", datetime(2026, 7, 4, 14, 30, 0), datetime(2026, 7, 4, 15, 0, 0)),
+            ("Bus101", datetime(2026, 7, 4, 13, 30, 0), datetime(2026, 7, 4, 14, 0, 0), None, None),
+            ("ENG209", datetime(2026, 7, 4, 14, 30, 0), datetime(2026, 7, 4, 15, 0, 0), None, None),
         ]
         result = calendar_lookup._select_subject_for_timestamp(target, events)
         self.assertEqual(result, "ENG209")
@@ -68,9 +77,50 @@ class CalendarLookupTests(unittest.TestCase):
     def test_select_subject_returns_none_when_no_overlapping_event(self):
         target = datetime(2026, 7, 4, 16, 10, 0)
         events = [
-            ("ENG209", datetime(2026, 7, 4, 14, 30, 0), datetime(2026, 7, 4, 15, 0, 0)),
+            ("ENG209", datetime(2026, 7, 4, 14, 30, 0), datetime(2026, 7, 4, 15, 0, 0), None, None),
         ]
         result = calendar_lookup._select_subject_for_timestamp(target, events)
+        self.assertIsNone(result)
+
+    def test_select_event_includes_professor_from_matched_event(self):
+        target = datetime(2026, 7, 4, 14, 44, 47)
+        events = [
+            ("ENG209", datetime(2026, 7, 4, 14, 30, 0), datetime(2026, 7, 4, 15, 0, 0), "Dr. Smith", None),
+        ]
+        info = calendar_lookup._select_event_for_timestamp(target, events)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.class_name, "ENG209")
+        self.assertEqual(info.professor, "Dr. Smith")
+
+    def test_select_event_includes_building_from_matched_event(self):
+        target = datetime(2026, 7, 4, 14, 44, 47)
+        events = [
+            ("ENG209", datetime(2026, 7, 4, 14, 30, 0), datetime(2026, 7, 4, 15, 0, 0), "Dr. Smith", "Science Hall"),
+        ]
+        info = calendar_lookup._select_event_for_timestamp(target, events)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.class_name, "ENG209")
+        self.assertEqual(info.professor, "Dr. Smith")
+        self.assertEqual(info.building, "Science Hall")
+
+    def test_parse_professor_from_body_finds_professor_line(self):
+        body = "Some notes here\nProfessor: Dr. Jones\nMore text"
+        result = calendar_lookup._parse_professor_from_body(body)
+        self.assertEqual(result, "Dr. Jones")
+
+    def test_parse_professor_from_body_returns_none_when_absent(self):
+        body = "No professor info here"
+        result = calendar_lookup._parse_professor_from_body(body)
+        self.assertIsNone(result)
+
+    def test_parse_building_from_body_finds_building_line(self):
+        body = "Some notes here\nBuilding: Ames Hall\nMore text"
+        result = calendar_lookup._parse_building_from_body(body)
+        self.assertEqual(result, "Ames Hall")
+
+    def test_parse_building_from_body_returns_none_when_absent(self):
+        body = "No building info here"
+        result = calendar_lookup._parse_building_from_body(body)
         self.assertIsNone(result)
 
     def test_to_local_naive_strips_timezone_without_converting(self):
@@ -144,8 +194,14 @@ class CalendarLookupTests(unittest.TestCase):
         config = CalendarRenameConfig(enabled=True, provider="auto", graph_auth_mode="device_code", graph_client_id="client")
 
         with (
-            patch("lecture_transcriber.calendar_lookup._find_graph_class_for_timestamp", side_effect=RuntimeError("graph fail")),
-            patch("lecture_transcriber.calendar_lookup._find_outlook_class_for_timestamp", return_value="bio101") as outlook,
+            patch(
+                "lecture_transcriber.calendar_lookup._find_graph_event_info_for_timestamp",
+                side_effect=RuntimeError("graph fail"),
+            ),
+            patch(
+                "lecture_transcriber.calendar_lookup._find_outlook_event_info_for_timestamp",
+                return_value=CalendarEventInfo(class_name="bio101"),
+            ) as outlook,
         ):
             result = find_class_for_timestamp(datetime.now(), config, lookback_minutes=60, lookahead_minutes=60)
 
@@ -155,7 +211,10 @@ class CalendarLookupTests(unittest.TestCase):
     def test_auto_provider_treats_placeholder_client_id_as_unconfigured(self):
         config = CalendarRenameConfig(enabled=True, provider="auto", graph_auth_mode="device_code", graph_client_id="YOUR_PUBLIC_CLIENT_ID_HERE")
 
-        with patch("lecture_transcriber.calendar_lookup._find_outlook_class_for_timestamp", return_value="bio101") as outlook:
+        with patch(
+            "lecture_transcriber.calendar_lookup._find_outlook_event_info_for_timestamp",
+            return_value=CalendarEventInfo(class_name="bio101"),
+        ) as outlook:
             result = find_class_for_timestamp(datetime.now(), config, lookback_minutes=60, lookahead_minutes=60)
 
         self.assertEqual(result, "bio101")

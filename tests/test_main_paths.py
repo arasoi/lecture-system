@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from lecture_transcriber.calendar_lookup import CalendarEventInfo
 from lecture_transcriber.main import (
     RecordingContext,
     ensure_unique_output_paths,
@@ -89,7 +90,7 @@ class OutputPathTests(unittest.TestCase):
                     return_value=datetime(2026, 7, 4, 13, 1, 19),
                 ),
                 patch(
-                    "lecture_transcriber.main.find_class_for_timestamp",
+                    "lecture_transcriber.main.find_class_info_for_timestamp",
                     side_effect=RuntimeError("Outlook calendar lookup is unavailable."),
                 ),
             ):
@@ -128,6 +129,7 @@ class OutputPathTests(unittest.TestCase):
                 obsidian_vault_dir=root / "vault",
                 transcript_dir=root / "transcripts",
                 calendar_rename=SimpleNamespace(enabled=True, lookback_minutes=180, lookahead_minutes=180),
+                quiet_period_minutes=0,
             )
 
             with (
@@ -170,10 +172,10 @@ class OutputPathTests(unittest.TestCase):
 
             def fake_lookup(target_time, config, lookback_minutes, lookahead_minutes):
                 seen["target_time"] = target_time
-                return "Physics 201"
+                return CalendarEventInfo(class_name="Physics 201", professor="Dr. Jones", building="Ames Hall")
 
             with (
-                patch("lecture_transcriber.main.find_class_for_timestamp", side_effect=fake_lookup),
+                patch("lecture_transcriber.main.find_class_info_for_timestamp", side_effect=fake_lookup),
                 patch(
                     "lecture_transcriber.main.recording_timestamp_from_file_metadata",
                     return_value=datetime(2026, 7, 4, 15, 21, 23),
@@ -190,6 +192,8 @@ class OutputPathTests(unittest.TestCase):
 
             self.assertEqual(seen["target_time"].strftime("%Y-%m-%d %H:%M:%S"), "2026-07-04 15:21:23")
             self.assertEqual(context.class_name, "Physics 201")
+            self.assertEqual(context.professor, "Dr. Jones")
+            self.assertEqual(context.building, "Ames Hall")
 
     def test_resolve_context_prefers_filename_timestamp_for_calendar_lookup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -200,10 +204,10 @@ class OutputPathTests(unittest.TestCase):
 
             def fake_lookup(target_time, config, lookback_minutes, lookahead_minutes):
                 seen["target_time"] = target_time
-                return "Cer101"
+                return CalendarEventInfo(class_name="Cer101", professor="Dr. Smith", building="Science Center")
 
             with (
-                patch("lecture_transcriber.main.find_class_for_timestamp", side_effect=fake_lookup),
+                patch("lecture_transcriber.main.find_class_info_for_timestamp", side_effect=fake_lookup),
                 patch(
                     "lecture_transcriber.main.recording_timestamp_from_file_metadata",
                     return_value=datetime(2026, 7, 4, 9, 0, 0),
@@ -222,6 +226,8 @@ class OutputPathTests(unittest.TestCase):
             self.assertEqual(seen["target_time"], datetime(2026, 7, 4, 13, 1, 19))
             self.assertEqual(context.class_name, "Cer101")
             self.assertEqual(context.created_time, datetime(2026, 7, 4, 13, 1, 19))
+            self.assertEqual(context.professor, "Dr. Smith")
+            self.assertEqual(context.building, "Science Center")
 
     def test_reclassifies_unknown_notes_into_class_folders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -230,19 +236,28 @@ class OutputPathTests(unittest.TestCase):
             unknown = vault / "unknown_class"
             unknown.mkdir(parents=True, exist_ok=True)
             note = unknown / "2026-07-04_13-01-19.md"
-            note.write_text("content", encoding="utf-8")
+            note.write_text(
+                "---\nClass Name: unknown_class\nProfessor:\nBuilding:\nDate:\nTime:\n---\n\ncontent\n",
+                encoding="utf-8",
+            )
 
             config = SimpleNamespace(
                 obsidian_vault_dir=vault,
                 calendar_rename=SimpleNamespace(lookback_minutes=180, lookahead_minutes=180),
             )
 
-            with patch("lecture_transcriber.main.find_class_for_timestamp", return_value="Cer101"):
+            with patch(
+                "lecture_transcriber.main.find_class_info_for_timestamp",
+                return_value=CalendarEventInfo(class_name="Cer101", professor="Dr. Smith", building="Ames Hall"),
+            ):
                 reclassify_unknown_notes(config)
 
             self.assertFalse(note.exists())
             # Canonical name built from parsed timestamp: MM-DD-YYYY_H.MM.SSam/pm
-            self.assertTrue((vault / "cer101" / "cer101_07-04-2026_1.01.19PM.md").exists())
+            destination = vault / "cer101" / "cer101_07-04-2026_1.01.19PM.md"
+            self.assertTrue(destination.exists())
+            self.assertIn("Professor: Dr. Smith", destination.read_text(encoding="utf-8"))
+            self.assertIn("Building: Ames Hall", destination.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -10,9 +10,9 @@ python diagnose_outlook.py
 ```
 
 This will tell you:
-- OK If Outlook calendar lookup is working
-- OK If any events are found around the current time
-- FAIL If there's an error accessing Outlook
+- ✅ If Outlook calendar lookup is working
+- ✅ If any events are found around the current time
+- ❌ If there's an error accessing Outlook
 
 ## Step 2: Check your config.yaml
 
@@ -38,9 +38,9 @@ Look for these log lines to understand what's happening:
 
 - `Recording X has file creation time: YYYY-MM-DD HH:MM:SS` — Shows the file's creation timestamp
 - `Looking up calendar event for...` — Shows the provider and search window
-- `Resolved class 'ClassName' for recording X` — OK Success! Class was found
-- `No calendar event found for X at time...` — FAIL No events found; check Outlook for events at that time
-- `Calendar-based class lookup failed for X` — FAIL Error accessing Outlook; see error message for details
+- `Resolved class 'ClassName' for recording X` — ✅ Success! Class was found
+- `No calendar event found for X at time...` — ❌ No events found; check Outlook for events at that time
+- `Calendar-based class lookup failed for X` — ❌ Error accessing Outlook; see error message for details
 
 ## Step 4: Verify Outlook has events
 

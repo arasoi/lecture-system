@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -13,7 +15,47 @@ GRAPH_SCOPES = ["Calendars.Read"]
 PLACEHOLDER_CLIENT_IDS = {"your_public_client_id_here", "your-client-id", "client_id_here"}
 
 
-def _select_subject_for_timestamp(target_time: datetime, events: list[tuple[str, datetime, datetime]]) -> Optional[str]:
+@dataclass
+class CalendarEventInfo:
+    """Information extracted from a matched calendar event."""
+    class_name: str
+    professor: Optional[str] = None
+    building: Optional[str] = None
+
+
+def _parse_labeled_value_from_body(body: str, labels: tuple[str, ...]) -> Optional[str]:
+    for line in (body or "").splitlines():
+        for label in labels:
+            m = re.match(rf"^\s*{re.escape(label)}\.?\s*[:\-]\s*(.+)$", line, flags=re.IGNORECASE)
+            if m:
+                value = m.group(1).strip()
+                return value if value else None
+    return None
+
+
+def _parse_professor_from_body(body: str) -> Optional[str]:
+    """
+    Extract a professor name from calendar event body text.
+
+    Looks for a line matching one of:
+        Professor: Dr. Smith
+        Prof: Smith
+        Professor - Dr. Smith
+    Returns the name stripped, or None if not found.
+    """
+    return _parse_labeled_value_from_body(body, ("Professor", "Prof"))
+
+
+def _parse_building_from_body(body: str) -> Optional[str]:
+    """Extract a building name from calendar event body text."""
+    return _parse_labeled_value_from_body(body, ("Building",))
+
+
+# Internal event tuple: (subject, start_time, end_time, professor_or_None, building_or_None)
+_EventTuple = tuple[str, datetime, datetime, Optional[str], Optional[str]]
+
+
+def _select_event_for_timestamp(target_time: datetime, events: list[_EventTuple]) -> Optional[CalendarEventInfo]:
     """
     Find the best matching event for a target time.
     
@@ -25,15 +67,16 @@ def _select_subject_for_timestamp(target_time: datetime, events: list[tuple[str,
     This allows for recordings that start slightly before/after class but are
     clearly intended for that class (e.g., 1:01 PM recording for 1:00 PM class).
     """
-    best_subject = None
+    best_event: Optional[_EventTuple] = None
     best_distance = None
-    direct_match = None
+    direct_match_event: Optional[_EventTuple] = None
     direct_match_distance = None
     
     max_distance_threshold = timedelta(minutes=30)
     event_buffer = timedelta(minutes=5)
     
-    for subject, start_time, end_time in events:
+    for entry in events:
+        subject, start_time, end_time, professor, building = entry
         if not subject:
             continue
         
@@ -42,7 +85,7 @@ def _select_subject_for_timestamp(target_time: datetime, events: list[tuple[str,
             distance_seconds = abs((target_time - start_time).total_seconds())
             if direct_match_distance is None or distance_seconds < direct_match_distance:
                 direct_match_distance = distance_seconds
-                direct_match = subject
+                direct_match_event = entry
         
         # Preference 2: Closest event (only if reasonably close)
         distance = abs(target_time - start_time)
@@ -50,10 +93,20 @@ def _select_subject_for_timestamp(target_time: datetime, events: list[tuple[str,
             distance_seconds = distance.total_seconds()
             if best_distance is None or distance_seconds < best_distance:
                 best_distance = distance_seconds
-                best_subject = subject
+                best_event = entry
     
     # Return direct match if found, otherwise return closest (if within threshold)
-    return direct_match if direct_match else best_subject
+    chosen = direct_match_event if direct_match_event else best_event
+    if chosen is None:
+        return None
+    subject, _start, _end, professor, building = chosen
+    return CalendarEventInfo(class_name=subject, professor=professor, building=building)
+
+
+def _select_subject_for_timestamp(target_time: datetime, events: list[_EventTuple]) -> Optional[str]:
+    """Thin wrapper — returns only the class name string for backward compatibility."""
+    info = _select_event_for_timestamp(target_time, events)
+    return info.class_name if info else None
 
 
 def _format_outlook_datetime(value: datetime) -> str:
@@ -90,9 +143,9 @@ def _target_time_variants(target_time: datetime) -> list[datetime]:
     return [target_time]
 
 
-def _find_outlook_class_for_timestamp(
+def _find_outlook_event_info_for_timestamp(
     target_time: datetime, lookback_minutes: int = 180, lookahead_minutes: int = 180
-) -> Optional[str]:
+) -> Optional[CalendarEventInfo]:
     try:
         import win32com.client
     except ImportError as exc:
@@ -115,8 +168,8 @@ def _find_outlook_class_for_timestamp(
     window_start = min(target_variants) - timedelta(minutes=lookback_minutes)
     window_end = max(target_variants) + timedelta(minutes=lookahead_minutes)
 
-    candidates: list[tuple[str, datetime, datetime]] = []
-    
+    candidates: list[_EventTuple] = []
+
     # Iterate through all items and filter manually (Restrict() doesn't iterate properly)
     for event in items:
         subject = str(getattr(event, "Subject", "") or "").strip()
@@ -134,15 +187,25 @@ def _find_outlook_class_for_timestamp(
         # Only include events in the search window
         if end_time < window_start or start_time > window_end:
             continue
-        
-        candidates.append((subject, start_time, end_time))
+
+        body = str(getattr(event, "Body", "") or "")
+        professor = _parse_professor_from_body(body)
+        building = _parse_building_from_body(body)
+        candidates.append((subject, start_time, end_time, professor, building))
 
     for target_variant in target_variants:
-        subject = _select_subject_for_timestamp(target_variant, candidates)
-        if subject:
-            return subject
-    
+        info = _select_event_for_timestamp(target_variant, candidates)
+        if info:
+            return info
+
     return None
+
+
+def _find_outlook_class_for_timestamp(
+    target_time: datetime, lookback_minutes: int = 180, lookahead_minutes: int = 180
+) -> Optional[str]:
+    info = _find_outlook_event_info_for_timestamp(target_time, lookback_minutes, lookahead_minutes)
+    return info.class_name if info else None
 
 
 def _ensure_aware_local(value: datetime) -> datetime:
@@ -284,9 +347,9 @@ def _graph_endpoint_for_calendar(config: CalendarRenameConfig, delegated: bool) 
     return f"https://graph.microsoft.com/v1.0/users/{mailbox}/calendarView"
 
 
-def _find_graph_class_for_timestamp(
+def _find_graph_event_info_for_timestamp(
     target_time: datetime, lookback_minutes: int, lookahead_minutes: int, config: CalendarRenameConfig
-) -> Optional[str]:
+) -> Optional[CalendarEventInfo]:
     auth_mode = (config.graph_auth_mode or "device_code").strip().lower()
     if auth_mode == "client_credentials":
         access_token = _acquire_graph_token_client_credentials(config)
@@ -296,7 +359,8 @@ def _find_graph_class_for_timestamp(
         delegated = True
     else:
         raise RuntimeError(
-            f"Unsupported calendar_rename.graph_auth_mode '{config.graph_auth_mode}'. Use 'device_code' or 'client_credentials'."
+            f"Unsupported calendar_rename.graph_auth_mode {config.graph_auth_mode!r}. "
+            "Use 'device_code' or 'client_credentials'."
         )
 
     target = _ensure_aware_local(target_time)
@@ -307,7 +371,7 @@ def _find_graph_class_for_timestamp(
         {
             "startDateTime": window_start.isoformat(),
             "endDateTime": window_end.isoformat(),
-            "$select": "subject,start,end",
+            "$select": "subject,start,end,body",
             "$top": "200",
         }
     )
@@ -323,7 +387,7 @@ def _find_graph_class_for_timestamp(
     except Exception as exc:
         raise RuntimeError(f"Failed to query Microsoft Graph calendar events: {exc}") from exc
 
-    candidates: list[tuple[str, datetime, datetime]] = []
+    candidates: list[_EventTuple] = []
     for event in payload.get("value", []):
         subject = str(event.get("subject", "") or "").strip()
         if not subject:
@@ -334,9 +398,18 @@ def _find_graph_class_for_timestamp(
         end_time = _parse_graph_datetime(str(end.get("dateTime", "")), end.get("timeZone"))
         if start_time is None or end_time is None:
             continue
-        candidates.append((subject, start_time, end_time))
-    return _select_subject_for_timestamp(target, candidates)
+        body_content = str((event.get("body") or {}).get("content", "") or "")
+        professor = _parse_professor_from_body(body_content)
+        building = _parse_building_from_body(body_content)
+        candidates.append((subject, start_time, end_time, professor, building))
+    return _select_event_for_timestamp(target, candidates)
 
+
+def _find_graph_class_for_timestamp(
+    target_time: datetime, lookback_minutes: int, lookahead_minutes: int, config: CalendarRenameConfig
+) -> Optional[str]:
+    info = _find_graph_event_info_for_timestamp(target_time, lookback_minutes, lookahead_minutes, config)
+    return info.class_name if info else None
 
 def prime_graph_login(config: CalendarRenameConfig) -> None:
     _acquire_graph_token_device_code(config, interactive=True)
@@ -355,22 +428,23 @@ def _graph_is_configured(config: CalendarRenameConfig) -> bool:
     return False
 
 
-def find_class_for_timestamp(
+def find_class_info_for_timestamp(
     target_time: datetime, config: CalendarRenameConfig, lookback_minutes: int = 180, lookahead_minutes: int = 180
-) -> Optional[str]:
+) -> Optional[CalendarEventInfo]:
+    """Return full event info (class name + professor) for the best matching calendar event."""
     provider = (config.provider or "auto").strip().lower()
     auto_mode = provider == "auto"
     if provider == "auto":
         provider = "graph" if _graph_is_configured(config) else "outlook"
     if provider == "outlook":
-        return _find_outlook_class_for_timestamp(
+        return _find_outlook_event_info_for_timestamp(
             target_time,
             lookback_minutes=lookback_minutes,
             lookahead_minutes=lookahead_minutes,
         )
     if provider == "graph":
         try:
-            return _find_graph_class_for_timestamp(
+            return _find_graph_event_info_for_timestamp(
                 target_time,
                 lookback_minutes=lookback_minutes,
                 lookahead_minutes=lookahead_minutes,
@@ -379,9 +453,16 @@ def find_class_for_timestamp(
         except RuntimeError:
             if not auto_mode:
                 raise
-            return _find_outlook_class_for_timestamp(
+            return _find_outlook_event_info_for_timestamp(
                 target_time,
                 lookback_minutes=lookback_minutes,
                 lookahead_minutes=lookahead_minutes,
             )
     raise RuntimeError(f"Unsupported calendar_rename.provider '{config.provider}'. Use 'graph', 'outlook', or 'auto'.")
+
+
+def find_class_for_timestamp(
+    target_time: datetime, config: CalendarRenameConfig, lookback_minutes: int = 180, lookahead_minutes: int = 180
+) -> Optional[str]:
+    info = find_class_info_for_timestamp(target_time, config, lookback_minutes, lookahead_minutes)
+    return info.class_name if info else None

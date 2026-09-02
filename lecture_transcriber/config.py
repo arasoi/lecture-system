@@ -4,6 +4,12 @@ from typing import Any, Optional
 
 import yaml
 
+DEFAULT_STATE_FILENAME = "processed_recordings.json"
+
+
+def default_state_path() -> Path:
+    return Path.home() / ".lecture_transcriber" / DEFAULT_STATE_FILENAME
+
 
 @dataclass
 class TranscriptionConfig:
@@ -33,6 +39,12 @@ class AppConfig:
     archive_dir: Optional[Path] = None
     error_dir: Optional[Path] = None
     calendar_rename: "CalendarRenameConfig" = None
+    # Tracks which recordings have already been processed, so a longer copy of a
+    # recording replaces its notes instead of creating a second set.
+    state_path: Path = None
+    # How long a recording must sit untouched before it is treated as finished, so that
+    # a recording still being synced is not processed while incomplete. 0 disables.
+    quiet_period_minutes: int = 20
 
 
 @dataclass
@@ -62,6 +74,7 @@ def load_config(path: Path) -> AppConfig:
     transcript_dir = Path(raw.get("transcript_dir", "")).expanduser()
     archive_dir = raw.get("archive_dir")
     error_dir = raw.get("error_dir")
+    state_path = raw.get("state_path")
 
     transcription_raw = raw.get("transcription", {}) or {}
     ollama_raw = raw.get("ollama", {}) or {}
@@ -99,6 +112,8 @@ def load_config(path: Path) -> AppConfig:
         transcription=transcription,
         ollama=ollama,
         calendar_rename=calendar_rename,
+        state_path=Path(state_path).expanduser() if state_path else default_state_path(),
+        quiet_period_minutes=int(raw.get("quiet_period_minutes", 20)),
     )
 
 
@@ -111,3 +126,5 @@ def ensure_directories(config: AppConfig) -> None:
         config.archive_dir.mkdir(parents=True, exist_ok=True)
     if config.error_dir is not None:
         config.error_dir.mkdir(parents=True, exist_ok=True)
+    if config.state_path is not None:
+        config.state_path.parent.mkdir(parents=True, exist_ok=True)

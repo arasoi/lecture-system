@@ -48,6 +48,8 @@ Edit `config.yaml` and set:
 - `transcript_dir` — folder for raw transcripts.
 - `archive_dir` — optional folder to move processed recordings after success.
 - `error_dir` — optional folder to move failed recordings for review.
+- `state_path` — file tracking which recordings have already been processed (see below). Defaults to `~/.lecture_transcriber/processed_recordings.json`.
+- `quiet_period_minutes` — how long a recording must sit untouched before it is treated as finished (see below). Defaults to `20`; `0` disables the check.
 - `ollama.model` — local Ollama model name.
 - `calendar_rename.provider` — `graph`, `outlook`, or `auto`.
 - `calendar_rename.graph_*` — Graph credentials/mailbox settings when using `graph`.
@@ -83,6 +85,55 @@ If a recording filename matches `Class_Name_MM-DD-YYYY_h.mm.ssAM/PM` (for exampl
 
 The class folder is created automatically if it does not exist.
 If a recording does not match the class/date/time pattern, notes are saved under `<obsidian_vault_dir>\unknown_class\`.
+
+## Partially-synced recordings
+
+OneDrive uploads a recording while it is still being recorded, so the same lecture can
+arrive in `source_dir` several times under one name, each copy longer than the last.
+Left alone this produces a separate transcript and note per copy (`lecture.md`,
+`lecture_1.md`, `lecture_2.md`, ...), each summarising a different-length prefix of the
+same class.
+
+Two checks guard against this.
+
+### Quiet period
+
+A recording is only processed once nothing has written to it for `quiet_period_minutes`
+(default 20). Between sync bursts the file sits at a constant size, so the short
+size-stability check cannot tell a lull apart from a finished recording — the quiet period
+has to outlast the sync cadence, measured at 10-14 minutes on this setup.
+
+Recordings that are still syncing are left in place rather than waited on, so the queue is
+never stalled; the next watcher run picks them up. In watch mode the source folder is
+re-scanned every five minutes, because no filesystem event fires once a recording simply
+stops growing. `--force` bypasses the quiet period for manual reprocessing.
+
+This means notes appear roughly 20 minutes after a lecture ends rather than immediately.
+Lower `quiet_period_minutes` to shorten that, at the risk of catching a recording mid-sync.
+
+### Processed-recording state
+
+If a partial copy does get through anyway — say OneDrive stalls for longer than the quiet
+period — each recording is also keyed by the start timestamp in its filename, which every
+partial copy shares, and the result is recorded in `state_path`. When another copy of a
+known recording arrives:
+
+- **It holds more audio** — it is transcribed and *replaces* the existing transcript and
+  note in place. The shorter recording is moved to `<archive_dir>\partials\`.
+- **It holds no more audio** — it is already covered, so it is skipped without
+  transcribing and moved straight to `<archive_dir>\partials\`.
+
+The archive root therefore keeps one file per lecture. The `partials` subfolder is
+pruned by the same `cleanup-audio-archive.ps1` retention job as the rest of the archive.
+
+Recordings whose filename carries no timestamp cannot be tracked this way — partial copies
+of those are indistinguishable from separate recordings, so they keep the previous
+behaviour of getting their own numbered note. Deleting `state_path` is safe: the next copy
+of each recording is simply treated as new.
+
+Both of these are backstops, not a cure. The cleanest fix is to record to a local folder on
+the laptop and only move the finished file into the OneDrive folder once recording stops,
+so a partial recording never reaches the watcher at all.
 
 ## Notes generation
 
